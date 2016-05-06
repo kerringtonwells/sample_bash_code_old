@@ -1,0 +1,404 @@
+#!/bin/bash
+
+KEY=/usr/local/libexec/netapp/.ssh/netapp_rsa
+#REMOVED DATABASE USER NAME 
+USER=<***>
+RUN_CMD="ssh -i ${KEY} -l ${USER}"
+
+
+SCRIPTPATH="<removed original script path>"
+SNAPPREFIX="manual"
+
+RED="\033[0;31m\033[1m"
+BLUE="\033[0;34m\033[1m"
+LGRAY="\033[0;37m\033[1m"
+NOCOLOR="\033[0m\033[0m"
+
+function usage () {
+	echo -e \
+"${LGRAY}Usage:${NOCOLOR}
+${LGRAY}\n  (Arguments in brackets [] are optional)\n${NOCOLOR}
+\t-n - NetApp filer management hostname/IP
+\t-c - vFiler context
+\t-v - volume name
+\t-f - path to restore file from
+\t-e - path to restore file to
+\t-a - {action} \n\t\tcreate - create snapshot\n\t\tlist - list snapshot\n\t\tdelete - delete snapshot
+\t\trestore_vol - restore a whole volume from a snapshot\n\t\trestore_file - restore a single file from a snapshot
+\t-s - snapshot name
+\t-p - snapshot prefix
+\t-q - skip warning prompts
+\t-h - show usage
+\t-m - cluster or 7 mode
+\t-r - maximum number of snapshots to retain
+\t-x - execute pre-run script
+\t-y - execute post-run script\n
+${LGRAY}Examples:${NOCOLOR}
+${BLUE}  List Volume Snapshots${NOCOLOR}
+  $(basename $0) -n filer_a [-c vfiler] -v vol -a list [-p prefix]
+${BLUE}  Create Volume Snapshots${NOCOLOR}
+  $(basename $0) -n filer_a [-c vfiler] -v volume -a create [-s snapshot] [-p prefix]
+${BLUE}  Create Volume Snapshots and execute {pre,post}-run scripts${NOCOLOR}
+  $(basename $0) -n filer_a [-c vfiler] -v volume -a create [-s snapshot] [-p prefix] [-x prerunscript] [-y postrunscript]
+${BLUE}  Delete Volume Snapshots${NOCOLOR}
+  $(basename $0) -n filer_b [-c vfiler] -v vol -a delete -s snapshot
+${BLUE}  Restore Whole Volume From Snaphot${NOCOLOR}
+  $(basename $0) -n filer_b [-c vfiler] -v vol -a restore_vol -s snapshot [-x prerunscript] [-y postrunscript]
+${BLUE}  Restore Single File From Snapshot${NOCOLOR}
+  $(basename $0) -n filer_a [-c vfiler] -v vol -a restore_file -s snapshot -f filefrom -e fileto [-x prerunscript] [-y postrunscript]
+\n"
+	exit 1
+}
+
+while getopts ":r:n:c:v:f:e:a:s:p:qhx:y:m:" opt; do
+	case $opt in
+		r)
+			ROTATE=$OPTARG
+			;;
+		n)
+			NETAPP=$OPTARG
+			;;
+		c)
+			CONTEXT=$OPTARG
+			VFILERRUN="vfiler run $CONTEXT"
+			;;
+		v)
+			VOL=$OPTARG
+			;;
+        m)
+            MODE=$OPTARG
+            ;;
+		f)	
+			FILEFROM=$OPTARG
+			;;
+		e)
+			FILETO=$OPTARG
+			;;
+		a)
+			ACTION=$OPTARG
+			;;
+		s)
+			SNAPNAME=$OPTARG
+			;;
+		p)
+			SNAPPREFIX=$OPTARG
+			;;
+		q)
+			QUIET="true"
+			;;
+		h)
+			usage
+			;;
+		x)
+			PRESCRIPT=$OPTARG
+			;;
+		y)
+			POSTSCRIPT=$OPTARG
+			;;
+		:)
+			echo -e "${RED}\nOption -$OPTARG requires an argument.\n${NOCOLOR}" >&2
+			usage
+			;;
+	esac
+done
+
+function formatName () {
+	local _snapprefix="$1"
+
+        if [ $2 ];then
+                        local _snapshotname=$2
+                else
+                        local _snapshotname=$(date +"%Y.%m.%d.%H:%M:%S")
+        fi
+	
+	echo "${_snapprefix}_${_snapshotname}"
+}
+
+#CREATE NETAPP SNAPSHOT
+function create () {
+	local _snapshot=$1
+	local _connectcmd="$RUN_CMD $NETAPP"
+	if [ '7' == $MODE ]; then
+		local _remotecmd=$($_connectcmd $VFILERRUN snap create \"$VOL\" \"$_snapshot\")
+	elif [ 'cluster' == $MODE  ]; then
+		local _remotecmd=$($_connectcmd volume snapshot create -volume \"$VOL\" -snapshot \"$_snapshot\")
+	else 
+		echo "puppet netapp::mode $MODE not supported." 1>&2
+		exit 255
+	fi	
+	echo -e "${_remotecmd%x} $_snapshot"
+}
+
+function rotate () {
+###
+## Output of snap list $VOLUME that we parse for snapshot prefix in function 'rotate'
+####
+## <snap list db_vol
+## Volume db_vol
+## working...
+##
+##   %/used       %/total  date          name
+##   ----------  ----------  ------------  --------
+##     0% ( 0%)    0% ( 0%)  Jun 10 14:27  15min_06.10.2014.14:30:01 
+##     1% ( 0%)    0% ( 0%)  Jun 10 14:12  15min_06.10.2014.14:15:01 
+##     1% ( 0%)    0% ( 0%)  Jun 10 13:57  15min_06.10.2014.14:00:01 
+##     1% ( 0%)    0% ( 0%)  Jun 10 13:57  hourly_06.10.2014.14:00:01 
+##     2% ( 0%)    0% ( 0%)  Jun 10 13:42  15min_06.10.2014.13:45:01 
+##     2% ( 0%)    0% ( 0%)  Jun 10 12:57  hourly_06.10.2014.13:00:01 
+##     3% ( 0%)    0% ( 0%)  Jun 10 12:53  hourly_06.10.2014.12:56:28 
+##   100% (100%)   6% ( 6%)  Jun 09 14:57  hourly_06.09.2014.15:00:01 
+##   100% (12%)    6% ( 0%)  Jun 09 14:42  hourly_06.09.2014.14:45:01 
+##   100% ( 0%)    6% ( 0%)  Jun 09 14:42  daily_06.09.2014.14:44:56 
+##   100% ( 0%)    6% ( 0%)  Jun 09 14:42  weekly_06.09.2014.14:44:51
+##
+	local _snapprefix="$1"
+	if [ $ROTATE ]; then
+			local _backupnum=$(list $_snapprefix|awk "/${_snapprefix}_/ {count++}END{print count}")
+			local _rmnum="$(( ${_backupnum} - ${ROTATE} ))"
+			if [ $_backupnum -gt $ROTATE ]; then
+					local _removesnaps=$(for _snapshot in $(list ${_snapprefix} \
+						|awk -F $1 "/${_snapprefix}_/ {print \$2}" \
+						|awk '{print $1}' \
+						|grep -v '^$' \
+						|sort -n \
+						|head -n $_rmnum) ; \
+
+
+						do delete ${_snapprefix}${_snapshot} ; done)
+					echo ${_removesnaps%x}
+			fi
+	fi
+}
+
+function restore_vol () {
+	local _snapshot=$1
+	local _connectcmd="$RUN_CMD $NETAPP"
+	if [ '7' == $MODE ]; then
+		local _remotecmd=$($_connectcmd $VFILERRUN snap restore -f -t vol -s \"$_snapshot\" \"$VOL\")
+	elif [ 'cluster' == $MODE ]; then
+		local _remotecmd=$($_connectcmd "set advanced; volume snapshot restore -volume \"$VOL\" -snapshot \"$_snapshot\"")
+	else
+		echo "puppet netapp::mode $MODE not supported." 1>&2
+		exit 255
+	fi 
+	echo -e "${_remotecmd%x}" 
+}
+
+function restore_file () {
+	local _snapshot=$1
+	local _fileto=$2
+	local _filefrom=$3
+        local _connectcmd="$RUN_CMD $NETAPP"
+	if ['7' == $MODE ]; then
+		local _remotecmd=$($_connectcmd $VFILERRUN \
+			snap restore -f -t file -s \"$_snapshot\" \ 
+			-r /vol/$VOL\"$_fileto\" /vol/$VOL\"$_filefrom\")
+	elif [ 'cluster' == $MODE  ]; then
+		echo "Can't restore files in cluster mode yet." 1>&2
+		exit 255
+	else
+		echo "puppet netapp::mode $MODE not supported." 1>&2
+		exit 255			
+	fi
+        echo -e "${_remotecmd%x}"
+}
+
+function delete () {
+	local _snapshot=${1:?"You must specify a snapshot to delete"}
+	local _connectcmd="$RUN_CMD $NETAPP"
+	if [ '7' == $MODE ]; then
+		local _remotecmd=$($_connectcmd $VFILERRUN snap delete \"$VOL\" \"$_snapshot\")
+	elif [ 'cluster' == $MODE ]; then
+		local _remotecmd=$($_connectcmd volume snapshot delete -volume \"$VOL\" \"$_snapshot\")
+	else 
+		echo "puppet netapp::mode $MODE not supported." 1>&2
+		exit 255
+	fi
+	echo -e "${_remotecmd%x} $_snapshot\n"
+}
+
+function list () {
+	local _prefix=$1
+	local _connectcmd="$RUN_CMD $NETAPP"
+	if [[ ( "x$_prefix" != "xmanual" ) ]]; then
+		echo -e "volume $VOL"
+		echo -e "working...\n"
+		if [ '7' == $MODE ]; then
+				echo -e " %/used 	%/total date    name\n----------  ----------------------  -------- "
+				local _remotecmd=$($_connectcmd $VFILERRUN snap list \"$VOL\" |awk '/${_prefix}_\d*/ {print $0}')
+		elif [ 'cluster' == $MODE ]; then 
+				echo -e "							---Blocks---\n\
+				Vserver   Volume   Snapshot				 State		Size	Total%   Used%\n\
+				--------- -------- ------------------------------------ ------- ------------  --------- ---------\n\
+				HawkEye_51 Database"
+
+				local _remotecmd=$($_connectcmd snapshot show \"$VOL\" -snapshot ${_prefix}_* |grep "${_prefix}_[[:digit:]]\{4\}.")
+		else 
+				echo "puppet netapp::mode $MODE not supported." 1>&2
+				exit 255 
+		fi
+		echo -e "${_remotecmd%x}\n"
+	else
+		if [ '7' == $MODE ]; then
+			local _remotecmd=$($_connectcmd $VFILERRUN snap list \"$VOL\")
+		elif [ 'cluster' == $MODE ]; then
+			local _remotecmd=$($_connectcmd snapshot show \"$VOL\")
+		else	
+			echo "puppet netapp::mode $MODE not supported." 1>&2
+			exit 255
+		fi
+		echo -e "${_remotecmd%x}\n"
+	fi
+}
+
+function prerun () {
+        if [[ ( "x$ACTION" != "xlist" ) && ( "x$ACTION" != "xdelete" ) \
+                        && ( "x$ACTION" != "xrestore_vol" ) && ( "x$ACTION" != "xrestore_file" ) \
+                        && ( -n $PRESCRIPT ) ]];  then
+                        if [[ ! -f $SCRIPTPATH/$PRESCRIPT ]];  then
+                                        echo -e "\n${RED}The script ($SCRIPTPATH/$PRESCRIPT) does not exist.\n${NOCOLOR}"
+                                        usage
+				else
+					/bin/bash $SCRIPTPATH/$PRESCRIPT
+                        fi
+        fi
+}
+
+function postrun () {
+        if [[ ( "x$ACTION" != "xlist" ) && ( "x$ACTION" != "xdelete" ) \
+                        && ( "x$ACTION" != "xrestore_vol" ) && ( "x$ACTION" != "xrestore_file" ) \
+                        && ( -n $POSTSCRIPT ) ]]; then
+                        if [[ ! -f $SCRIPTPATH/$POSTSCRIPT ]]; then
+                                        echo -e "\n${RED}The script ($SCRIPTPATH/$POSTSCRIPT) does not exist.\n${NOCOLOR}"
+                                        usage
+                                else
+                                        /bin/bash $SCRIPTPATH/$POSTSCRIPT
+                        fi
+        fi
+}
+
+function warning () {
+	if [ -z $QUIET ]; then
+			local _warnitem="$1"
+			echo -e "\n${RED}You are about to $_warnitem a snapshot!\n"
+			tput sgr0
+			read -p "Do you wish to continue? " yn
+			case $yn in
+				[Yy]* ) 
+					echo -e "Continuing...\n"
+					;;
+				[Nn]* ) 
+					exit
+					tput sgr0
+					;;
+				*)
+					echo -e "${RED}Please answer yes or no.${NOCOLOR}"
+					exit
+					;;
+			esac
+	fi
+}
+
+function checkFlags () {
+	if [ -z $NETAPP ]; then
+			echo -e "\n${RED}You did not specify a filer to connect to.\n${NOCOLOR}"
+			usage
+	fi
+	
+
+	if [[ ( $ROTATE ) && ( -z $SNAPPREFIX ) ]]; then
+			echo -e "\n${RED}Please specify a prefix (-p).\n${NOCOLOR}"
+			usage
+	fi
+
+	if [[ ( $CONTEXT ) && ( -z $CONTEXT ) ]]; then
+			echo -e "\n${RED}You did not specify a vFiler context.\n${NOCOLOR}"
+			usage
+	fi
+
+	if [ -z $VOL ]; then
+			echo -e "\n${RED}You did not specify a volume.\n${NOCOLOR}"
+			usage
+	fi	
+
+	if [ -z $MODE ];then
+			echo -e "\n${RED}You did not specify a mode type (cluster or 7)"
+			usage
+	fi
+
+	if [ $MODE != "cluster" ] && [ $MODE != 7   ]; then
+			echo -e "\n${RED}Mode must be either 7 or cluster."
+        		usage
+	fi
+
+	if [ -z $ACTION ]; then
+			echo -e "\n${RED}You did not specify an action.\n${NOCOLOR}"
+			usage
+	fi
+
+	if [[ ( "x$ACTION" != "xlist" ) && ( "x$ACTION" != "xcreate" ) && ( -z $SNAPNAME ) ]]; then
+			echo -e "\n${RED}You did not specify a snapshot name.\n${NOCOLOR}"
+			usage
+	fi
+
+	if [[ ( -z $FILEFROM ) && ( "x$ACTION" = "xrestore_file" ) ]]; then
+			echo -e "\n${RED}You did not specify a file to restore from.\n${NOCOLOR}"
+			usage
+	fi
+
+	if [[ ( -z $FILETO ) && ( "x$ACTION" = "xrestore_file" ) ]]; then
+			echo -e "\n${RED}You did not specify a file to restore to.\n${NOCOLOR}"
+			usage
+	fi
+
+        if [[ ( $PRESCRIPT ) && ( -z $PRESCRIPT ) ]]; then
+                        echo -e "\n${RED}You did not specify a pre-run script to execute\n${NOCOLOR}"
+			usage
+        fi
+
+        if [[ ( $POSTSCRIPT ) && ( -z $POSTSCRIPT ) ]]; then
+                        echo -e "\n${RED}You did not specify a post-run script to execute\n${NOCOLOR}"
+			usage
+        fi
+}
+
+
+checkFlags
+
+
+case "$ACTION" in
+	create)
+		SNAPSHOT=$(formatName $SNAPPREFIX $SNAPNAME)
+		warning "$ACTION"
+		prerun
+		create $SNAPSHOT
+		postrun
+		rotate $SNAPPREFIX
+		;;
+	delete)
+		SNAPSHOT=$SNAPNAME
+		warning "$ACTION"
+		delete $SNAPSHOT
+		;;
+	restore_vol)
+		SNAPSHOT=$(formatName $SNAPPREFIX $SNAPNAME)
+		warning "restore a whole volume from"
+		prerun
+		restore_vol $SNAPSHOT
+		postrun
+		;;
+	restore_file)
+		SNAPSHOT=$(formatName $SNAPPREFIX $SNAPNAME)
+		warning "restore a single file from"
+		prerun
+		restore_file $SNAPSHOT $FILETO $FILEFROM
+		postrun
+		;;
+	list)
+		SNAPSHOT=$(formatName $SNAPPREFIX $SNAPNAME)
+		list $SNAPPREFIX
+		;;
+	*)
+		usage
+		;;
+esac

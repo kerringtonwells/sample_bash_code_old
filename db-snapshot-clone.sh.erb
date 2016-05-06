@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+###################################################################################################################
+# In the following examples keep in mind that the Target (variable) represents the Cloned Volume and the Volume (varible) represents the Master Volume.  
+#
+# STOP ORACLE, UNMOUNT DB, DELETE VOLUME, CREATE VOLUME BASED ON LATEST SNAPSHOT AND RESTART ORACLE:
+# db-snapshot-clone.sh -a snapupdate -e <environment> -m <mode> -t <target>  -v <volume>
+#
+# STOP ORACLE, UNMOUNT DB, DELETE VOLUME, CREATE VOLUME BASED ON LATEST SNAPSHOT AND RESTART ORACLE (WITHOUT PROMPTING USER)
+# db-snapshot-clone.sh -a snapupdate -f force -e <environment> -m <mode> -t <target>  -v <volume> 
+#
+# SHUTDOWN ORACLE:
+# db-snapshot-clone.sh -a shutdownDB 
+#
+# START ORACLE:
+# db-snapshot-clone.sh -a startDB -e <environment>
+#
+# UNMOUNT A DB:
+# db-snapshot-clone.sh -a unmountDB -t <target>
+#
+# MOUNT A DB: 
+# db-snapshot-clone.sh -a dbmount -e <environment> -m <mode> -t <target> -v <volume>
+#
+# CREATE VOLUME BASED ON THE MASTER VOLUMES LATEST SNAPSHOT:                                          
+# db-snapshot-clone.sh -a create_vol_latest_snap -m <mode> -e <environment> -t <target> -v <volume>                                                                                                                                          ##################################################################################################################
+
+RED="\033[0;31m\033[1m"
+BLUE="\033[0;34m\033[1m"
+LGRAY="\033[0;37m\033[1m"
+NOCOLOR="\033[0m\033[0m"
+
+
+function usage (){
+echo ""
+        echo -e \
+"${LGRAY}Usage:${NOCOLOR}
+\t-t - Specify Target 
+\t-v - Specify Volume name
+\t-a - Action
+\t-e - Specify Environment
+\t-m - Mode type that will be based to netvol or netsnap 
+\t-h - Show usage
+${LGRAY}Examples:${NOCOLOR}
+${BLUE} DELETE VOLUME WITHOUT PROMPTING USER: ${NOCOLOR}
+ $(basename $0) -f -a snapupdate -e <environment>  -t <target>  -v <volume>
+${BLUE} SHUTDOWN ORACLE:${NOCOLOR}
+  $(basename $0) -a shutdownDB
+${BLUE} START ORACLE:${NOCOLOR}
+  $(basename $0) -a startDB
+${BLUE} UNMOUNT A DB:${NOCOLOR}
+  $(basename $0) -a unmountDB -t <target>
+${BLUE} MOUNT A DB:${NOCOLOR}
+  $(basename $0) -a  dbmount -t <target>
+${BLUE} CREATE VOLUME BASED ON THE MASTER VOLUMES LATEST SNAPSHOT: ${NOCOLOR}
+ $(basename $0) -a create_vol_latest_snap -e <environment>  -t <target>  -v <volume>
+${BLUE} STOP ORACLE, UNMOUNT DB, DELETE VOLUME, CREATE VOLUME BASED ON LATEST SNAPSHOT AND RESTART ORACLE: ${NOCOLOR}
+ $(basename $0) -a snapupdate -e <environment>  -t <target>  -v <volume>
+        \n"
+        exit 1
+}
+
+SELINUX_ROLE=$(id -Z | awk -F: '{print $2}')
+
+while getopts ":n:c:v:a:hs:t:e:f:m:" opt; do
+  case $opt in
+    v)
+      MASTERVOL=$OPTARG
+      ;;
+    a)
+      ACTION=$OPTARG
+      ;;
+    t)
+      TARGET=$OPTARG
+      ;;
+    e)
+      ENVIRONMENT=$OPTARG
+      ;;
+    m)
+      MODE=$OPTARG
+      ;;
+    f)
+      FORCE=$OPTARG
+      ;;
+    h)
+      usage
+      ;;
+    :)
+      echo -e "${RED}\nOption -$OPTARG requires an argument.\n${NOCOLOR}" >&2
+      usage
+      ;;
+   esac
+done
+
+#GRAB THE LASTEST SNAPSHOT FROM NETAPP
+LATEST_SNAPSHOT=$(/usr/local/sbin/netsnap.sh -n $ENVIRONMENT -m $MODE -a list -v  $MASTERVOL|grep -B1 display|head -1|awk '{print $1}')
+
+
+function SHUTDOWNDB () {
+  if [ "oracle_r" = "${SELINUX_ROLE}" ]; then
+    dbshut ${ORACLE_SID}
+    else
+      /sbin/runuser -l oracle -c "dbshut ${ORACLE_SID}"
+  fi
+}
+
+#FUNTION IS USED TO ALLOW USERS TO SPECIFY SHUTDONW START UP AND SHUTDOWN ACTIONS WITHOUT ADDING EXTRA INFORMATION SUCH AS ENVIORNMENT
+function shorthand () {
+  if [ 'shutdownDB' == $ACTION ]; then
+    SHUTDOWNDB
+    echo -e "\n${RED}Oracle database was been shutdown${NOCOLOR} \n"
+    exit 0
+  fi
+
+  if [ 'startDB' == $ACTION ]; then
+    STARTDB
+    echo -e "\n${RED}Oracle Database was been started${NOCOLOR} \n"
+    exit 0
+  fi
+
+  if [ 'unmountDB' == $ACTION ]; then
+    SHUTDOWNDB
+    UNMOUNTDB
+    exit 0
+  fi
+}
+
+
+function DELETE () {
+  if [[ $FORCE == "force" ]]; then
+    /usr/local/sbin/netvol.sh -n $ENVIRONMENT -a delete -m $MODE -v $TARGET
+    else  
+      echo ""
+      echo "Are you sure you want to delete $TARGET?"
+      echo "Enter yes or no"
+      read SELECTION
+    if [ $SELECTION == "yes" ]; then  
+      /usr/local/sbin/netvol.sh -n $ENVIRONMENT -a delete -m $MODE -v $TARGET
+      else 
+        STARTDB     
+        exit 0
+    fi
+  fi   
+}
+
+#QUERY THE NETAPP TO CREATE A VOLUME USING THE LASTEST SNAPSHOT
+function CREATE_VOL_LATEST_SNAP () {
+  /usr/local/sbin/netvol.sh -n $ENVIRONMENT -a clone -v $MASTERVOL -m $MODE -s $LATEST_SNAPSHOT -t $TARGET
+}
+
+
+function STARTDB () {
+  START_ORACLE="
+  startup mount pfile=/opt/oracle/admin/$ORACLE_SID/pfile/init$ORACLE_SID.ora
+  recover database
+  auto
+  alter database open;
+  exit  
+  "
+  if [ "oracle_r" = "${SELINUX_ROLE}" ]; then
+    sqlplus / as sysdba << _EOF_
+    $START_ORACLE
+_EOF_
+      else
+        /sbin/runuser -l oracle -c "sqlplus / as sysdba << _EOF_
+        $START_ORACLE
+        _EOF_"
+  fi
+}
+
+
+function UNMOUNTDB () {
+  for mount in $(mount -t nfs |grep $TARGET  |awk '{print $1}' |sort -r) ; do umount -t nfs $mount ; done
+}
+
+
+function DBMOUNT () {
+  mkdir -p /opt/oracle/admin/$ORACLE_SID/{pfile,adump,diag,audit}
+  mount $ENVIRONMENT:/$TARGET/oradata/$ORACLE_SID                                     /u01/oradata/$ORACLE_SID
+  mount $ENVIRONMENT:/$TARGET/admin/$ORACLE_SID/pfile                                 /opt/oracle/admin/$ORACLE_SID/pfile
+  mount $ENVIRONMENT:/$TARGET/admin/$ORACLE_SID/adump                                 /opt/oracle/admin/$ORACLE_SID/adump
+  mount $ENVIRONMENT:/$TARGET/admin/$ORACLE_SID/diag                                  /opt/oracle/admin/$ORACLE_SID/diag
+  mount $ENVIRONMENT:/$TARGET/admin/$ORACLE_SID/audit                                 /opt/oracle/admin/$ORACLE_SID/audit
+}
+
+#SHUTDOWN UNMOUN, DELETE THE PREVIOUS VOLUME THEN CREATE A NEW VOLUME USING THE LASTEST SNAPSHOT,MOUNT THE NEW VOLUME AND START UP ORACLE
+function SNAPUPDATE () {  
+  SHUTDOWNDB 
+  UNMOUNTDB
+  DELETE
+  CREATE_VOL_LATEST_SNAP
+  DBMOUNT
+  STARTDB
+}
+
+
+function check_flags () {
+  if [ -z $TARGET ]; then
+    echo -e "\n${RED}You did not specify a Target Volume!${NOCOLOR} \n"
+    usage
+    exit 1
+  fi
+
+  if [ -z $TARGET ] && [ -z $MASTERVOL ]; then
+    echo -e "\n${RED}You did not specify a Target Volume or a Master Volume!${NOCOLOR} \n"
+    usage
+    exit 1
+  fi
+
+  if [ -z $MASTERVOL ]; then
+    echo -e "\n${RED}You did not specify a Master Volume!${NOCOLOR} \n"
+    usage
+    exit 1
+  fi
+
+  if [ -z $ENVIRONMENT ]; then
+    echo -e "\n${RED}You did not specify an Environment (Example: netapp)!${NOCOLOR} \n"
+    usage
+    exit 1
+  fi
+
+  if [ -z $ACTION ]; then
+    echo -e "\n${RED}You did not specify an Action!${NOCOLOR} \n"
+    usage
+    exit 1
+  fi
+
+  if [ -z $ORACLE_SID ]; then 
+    echo -e "\n${RED}There is no ORACLE_SID Environmental varible set${NOCOLOR}\n" 
+    exit 1
+  fi 
+
+  if [ -z $MODE ]; then
+    echo -e "\n${RED}You did not specify a mode type${NOCOLOR}\n"
+    exit 1
+  fi  
+}
+#NOTE THAT THE SHORTHAND AND check_flags FUNCTIONS ARE ALWAYS CALLED
+shorthand
+check_flags
+
+
+#BASED ON THE ACTIONS SPECIFIED BY USEERS RUN ONE OR MORE OF THE FOLLOWING FUNCTIONS
+case "$ACTION" in
+  create_vol_latest_snap)
+    CREATE_VOL_LATEST_SNAP
+    ;;
+  startDB)
+    STARTDB
+    ;;
+  unmountDB)
+    UNMOUNTDB
+    ;;
+  shutdownDB)
+    SHUTDOWNDB
+    ;;
+  snapupdate)
+    SNAPUPDATE
+    ;;
+  dbmount)
+    DBMOUNT
+    ;;
+  delete)
+    DELETE
+    ;;
+  *)
+    usage
+    ;;
+esac
