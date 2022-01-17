@@ -14,3 +14,4 @@ run:
     ./docs-platform-automation-reference-pipeline-config/test_concourse.sh
     which bosh
     uname -r
+    exit 1
