@@ -10,8 +10,8 @@ run:
   args:
   - -exc
   - |
+    exit 1
     chmod 777 docs-platform-automation-reference-pipeline-config/test_concourse.sh
     ./docs-platform-automation-reference-pipeline-config/test_concourse.sh
     which bosh
     uname -r
-    exit 1
