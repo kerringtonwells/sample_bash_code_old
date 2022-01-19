@@ -3,7 +3,7 @@
 platform: linux
 
 inputs:
-- name: docs-platform-automation-reference-pipeline-config
+- name: sample_bash_code_old
 
 run: 
   path: sh
@@ -11,7 +11,7 @@ run:
   - -exc
   - |
     exit 1
-    chmod 777 docs-platform-automation-reference-pipeline-config/test_concourse.sh
-    ./docs-platform-automation-reference-pipeline-config/test_concourse.sh
+    chmod 777 sample_bash_code_old/test_concourse.sh
+    ./sample_bash_code_old/test_concourse.sh
     which bosh
     uname -r
